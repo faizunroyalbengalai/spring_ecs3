@@ -1,0 +1,174 @@
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+        working-directory: terraform
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="spring_datasource_url=${{ secrets.SPRING_DATASOURCE_URL }}" \
+            -var="spring_datasource_username=${{ secrets.SPRING_DATASOURCE_USERNAME }}" \
+            -var="spring_datasource_password=${{ secrets.SPRING_DATASOURCE_PASSWORD }}" \
+            -var="spring_data_mongodb_uri=${{ secrets.SPRING_DATA_MONGODB_URI }}" \
+            -var="spring_profiles_active=${{ secrets.SPRING_PROFILES_ACTIVE }}" \
+            -var="rds_install_db=${{ secrets.RDS_INSTALL_DB }}" \
+            -var="db_type=${{ secrets.DB_TYPE }}" \
+            -var="db_name=${{ secrets.DB_NAME }}" \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}"
+        working-directory: terraform
+
+  build-and-push:
+    needs: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Build application
+        run: |
+          if [ -f mvnw ] && [ -f .mvn/wrapper/maven-wrapper.properties ]; then
+            chmod +x mvnw && ./mvnw clean package -DskipTests
+          elif [ -f pom.xml ]; then
+            mvn clean package -DskipTests
+          elif [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            chmod +x gradlew && ./gradlew bootJar -x test
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            gradle bootJar -x test
+          else
+            echo "ERROR: No build file found" && exit 1
+          fi
+
+      - name: Find and verify JAR
+        id: jar
+        run: |
+          JAR=$(find target build/libs -name "*.jar" \
+            ! -name "*sources*" ! -name "*javadoc*" ! -name "*plain*" \
+            2>/dev/null | head -1)
+          if [ -z "$JAR" ]; then
+            echo "ERROR: No JAR built" && exit 1
+          fi
+          echo "jar_path=$JAR" >> $GITHUB_OUTPUT
+          echo "Built JAR: $JAR"
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: image
+        run: |
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ secrets.PROJECT_NAME }}:${{ github.sha }}"
+          IMAGE_LATEST="${{ steps.login-ecr.outputs.registry }}/${{ secrets.PROJECT_NAME }}:latest"
+          docker build -t $IMAGE .
+          docker tag $IMAGE $IMAGE_LATEST
+          docker push $IMAGE
+          docker push $IMAGE_LATEST
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+  deploy-ecs:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.PROJECT_NAME }}-cluster \
+            --service ${{ secrets.PROJECT_NAME }}-service \
+            --force-new-deployment
+
+      - name: Wait for ECS service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.PROJECT_NAME }}-cluster \
+            --services ${{ secrets.PROJECT_NAME }}-service
+
+  verify:
+    needs: deploy-ecs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+        working-directory: terraform
+
+      - name: Get ALB URL
+        id: alb
+        run: |
+          ALB_URL=$(terraform output -raw alb_url)
+          echo "alb_url=$ALB_URL" >> $GITHUB_OUTPUT
+          echo "ALB URL: $ALB_URL"
+        working-directory: terraform
+
+      - name: Health check
+        run: |
+          ALB_URL="${{ steps.alb.outputs.alb_url }}"
+          echo "Waiting for application to be healthy at $ALB_URL/actuator/health"
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ALB_URL/actuator/health" || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              echo "Application is healthy"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "ERROR: Application did not become healthy after 300 seconds"
+          exit 1
+
+      - name: Print live URL
+        run: |
+          echo "Application is available at: ${{ steps.alb.outputs.alb_url }}"
